@@ -1,0 +1,135 @@
+        -- deliveries detail 
+        
+with filter as (select date('2024-01-01') as "start",
+                       date(current_date) as "end",
+                       ('BCNF4 - Marina') as "mfc")
+
+SELECT DISTINCT 
+    year(order_created_local_at)                                                                                                    as year,
+    month(order_created_local_at)                                                                                                   as Month,
+    date(date_format(date(order_created_local_at), '%Y-%m-%d'))                                                                     as day,
+    sa.city_code                                                                                                                    as city,
+    CASE    when sa.city_code = 'BCN' Then 'Barcelona'
+            when sa.city_code = 'MAD' Then 'Madrid'
+            when sa.city_code = 'VAL' Then 'Valencia'
+            when sa.city_code = 'PAL' Then 'Mallorca'
+            when sa.city_code = 'SEV' Then 'Sevilla'
+            when sa.city_code = 'MAL' Then 'Malaga'
+            when sa.city_code = 'ZAR' Then 'Zaragoza'
+            else null end                                                                                                           as shift_area,
+    sa.warehouse_name                                                                                                               as mfc_name,
+    CASE WHEN od.courier_id = 0 THEN NULL ELSE od.courier_id END                                                                    as courier_id,
+    CASE WHEN od.courier_id is null THEN null 
+    ELSE cast (od.courier_id as Varchar) ||'-'
+            || cast(day(order_created_local_at) as Varchar)
+            || cast(month(order_created_local_at) as Varchar) 
+            || CAST(YEAR(order_created_local_at) % 100 AS VARCHAR) end                                                              as shift_id,
+
+    od.order_id                                                                                                                     as order_id,
+    ol.bundle_id                                                                                                                    as bundle_id,
+    od.order_final_status                                                                                                           as final_status,
+    ol.num_orders_in_bundle                                                                                                         as num_bundled,
+    date_format(od.order_picked_up_by_courier_local_at, '%Y-%m-%d %H:%i:%s')                                                        as del_acepted_at,
+    ol.is_canceled                                                                                                                  as canceled,
+    od.order_cancel_reason                                                                                                          as cancel_reason,
+    date_format(od.order_terminated_local_at, '%Y-%m-%d %H:%i:%s')                                                                  as order_terminated_local_at,
+    ROUND((DATE_DIFF('second', CAST(order_created_local_at AS TIMESTAMP), 
+        CAST(order_terminated_local_at AS TIMESTAMP)) / 60.00), 2)                                                                  as "courier_delivered_time_(min)",
+    date_format(order_courier_arrival_to_pickup_local_at, '%Y-%m-%d %H:%i:%s')                                                      as courier_arrival_to_pickup_at,
+    ROUND((DATE_DIFF('second', CAST(order_courier_arrival_to_pickup_local_at AS TIMESTAMP), 
+        CAST(order_picked_up_by_courier_local_at AS TIMESTAMP)) / 60.00), 2)                                                        as "Waiting_time_pickup_(min)",
+    date_format(order_picked_up_by_courier_local_at, '%Y-%m-%d %H:%i:%s')                                                           as picked_up_by_courier_at,
+    ROUND((DATE_DIFF('second', CAST(order_picked_up_by_courier_local_at AS TIMESTAMP), 
+        CAST(order_courier_arrival_to_delivery_local_at AS TIMESTAMP)) / 60.00), 2)                                                 as "point_distance_time(min)",
+    date_format(order_courier_arrival_to_delivery_local_at, '%Y-%m-%d %H:%i:%s')                                                    as courier_arrival_to_delivery_at,
+    ROUND((DATE_DIFF('second', CAST(order_courier_arrival_to_delivery_local_at AS TIMESTAMP), 
+        CAST(order_terminated_local_at AS TIMESTAMP)) / 60.00), 2)                                                                  as "Waiting_time_Delivered_(min)",
+    CASE WHEN od.order_parent_relationship_type IS NULL THEN 'single_order' 
+        ELSE od.order_parent_relationship_type END                                                                                  as order_type,
+    (bo.weight_in_grams) / 1000.00                                                                                                  as "weight_in_Kg",
+    Round(1 * (
+            case
+                when od.order_final_status = 'DeliveredStatus'
+                and od.order_parent_relationship_type is null then disp.dispatch_to_acceptance
+                else null end / 60.00),2)                                                                                           as "partner_acc_time_(min)", 
+    (case
+                when dpo.order_accepted_by_partner_at is null
+                or dpo.order_dispatched_at is null
+                or od.order_picked_up_by_courier_at is null
+                or od.order_courier_arrival_to_pickup_at is null
+                or od.order_final_status <> 'DeliveredStatus' then null
+            else (
+                date_diff('second', dpo.order_accepted_by_partner_at, dpo.order_ready_for_pickup_at) / 60.00) end)                  as "prep_time_(min)",
+    round((1.00 * (case when od.order_final_status = 'DeliveredStatus' and od.order_parent_relationship_type is null 
+            then disp.dispatch_to_acceptance else null end)
+            +  (
+                case
+                    when dpo.order_accepted_by_partner_at is null
+                    or dpo.order_dispatched_at is null
+                    or od.order_picked_up_by_courier_at is null
+                    or od.order_courier_arrival_to_pickup_at is null
+                    or od.order_final_status <> 'DeliveredStatus' then null
+                    else (date_diff('second', dpo.order_accepted_by_partner_at, dpo.order_ready_for_pickup_at)) 
+                    end)) /60.00,2)                                                                                                 as "total_handling_time_(min)", 
+    ore.from_order_id                                                                                                               as "remake/split_from",
+    case when ore.from_order_id is not null then (bo2.weight_in_grams) / 1000.00 else null end                                      as Weight_second_order, 
+    case when ore.from_order_id is not null
+                    and od.courier_id = (
+                        Select od2.courier_id 
+                        from  "delta"."central_order_descriptors_odp"."order_descriptors_v2" od2
+                        Where od2.order_id = ore.from_order_id)
+                    Then 'true' else 'false' end                                                                                    as "from_order_same_courier",
+    --al.action                                                                                                                       as action,
+    al.actor_id                                                                                                                     as operator
+
+FROM 
+    "delta"."central_order_descriptors_odp"."order_descriptors_v2" od
+
+LEFT JOIN 
+    "delta"."courier__in_house_supply__odp"."driven_distance_order_level" ol
+    ON ol.order_id = od.order_id
+    AND ol.courier_id = od.courier_id
+
+INNER JOIN delta.mfc_sales_odp.mfc_store_addresses_history sa
+    ON  (current_date) between valid_from and valid_to 
+    and sa.warehouse_business_id is not null
+    and  sa.store_address_id = od.store_address_id
+
+LEFT JOIN delta.mfc__mfc_big_orders__odp.mfc_big_orders  AS bo 
+    ON bo.order_id = od.order_id
+
+LEFT JOIN delta.central_dispatched_partner_orders_odp.dispatched_partner_orders as dpo 
+    ON dpo.order_id = od.order_id
+
+LEFT JOIN delta.courier_partner_quality_odp.dispatching_partner_times as disp 
+    ON disp.order_id = od.order_id
+
+LEFT JOIN  delta.central__order_relations__odp.order_relations as ore
+    ON ore.to_order_id = od.order_id
+
+
+LEFT JOIN delta.mfc__mfc_big_orders__odp.mfc_big_orders  AS bo2 
+    ON bo2.order_id = ore.from_order_id
+
+LEFT JOIN delta.contact_audit_logs_odp.audit_log_entries al
+    ON al.subject_id = CAST(od.order_id AS VARCHAR)
+
+
+WHERE 
+    order_created_local_at BETWEEN (select "start" from filter) and (select "end" from filter)
+    AND sa.country_code = 'ES'
+    --AND sa.city_code = 'BCN'
+    --AND sa.warehouse_name = (select "mfc" from filter)
+    AND (od.order_handling_strategy) <> 'PICKUP' 
+    AND (od.order_handling_strategy) <> 'GEN1' 
+    --AND sa.warehouse_name <> 'BCNF4 - Marina'
+    AND    case when ore.from_order_id is not null
+                    and od.courier_id = (
+                        Select od2.courier_id 
+                        from  "delta"."central_order_descriptors_odp"."order_descriptors_v2" od2
+                        Where od2.order_id = ore.from_order_id)
+                    Then 'true' else 'false' end  = 'true'
+    AND case when  al.actor_id = 159711304 then  al.action = ('Assign') else  al.action in ('Assign', 'Reassign', 'NULL') end
+    AND case when ore.from_order_id is not null then (bo2.weight_in_grams) / 1000.00 else null end > 23
+    AND al.actor_id = 139733525
+ORDER BY 3 desc
